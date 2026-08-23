@@ -1,0 +1,6 @@
+langchain==1.2.10
+langchain-core==1.2.10
+langchain-openai==1.2.10
+langgraph==1.2.10
+pydantic==2.12.5
+python-dotenv==1.2.1
