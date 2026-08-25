@@ -1,16 +1,27 @@
 import os
 
 from dotenv import load_dotenv
-from langchain_openai import ChatOpenAI
+
 from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_core.messages import AIMessage
 from langchain_core.outputs import ChatGeneration, ChatResult
+from langchain_openai import ChatOpenAI
 
 
 load_dotenv()
 
 
 class MockLLM(BaseChatModel):
+    """
+    Modelo simulado utilizado cuando no existe OPENAI_API_KEY.
+
+    Permite probar toda la arquitectura sin depender
+    de una API externa.
+
+    El MockLLM NO inventa información de investigación.
+    Cuando no dispone de información real, lo indica
+    explícitamente.
+    """
 
     @property
     def _llm_type(self) -> str:
@@ -24,7 +35,7 @@ class MockLLM(BaseChatModel):
         messages,
         stop=None,
         run_manager=None,
-        **kwargs
+        **kwargs,
     ) -> ChatResult:
 
         conversation = "\n".join(
@@ -39,15 +50,19 @@ class MockLLM(BaseChatModel):
         if "role: supervisor" in conversation:
 
             if "no existe investigación todavía" in conversation:
+
                 response = "researcher"
 
             elif "todavía no existe un análisis" in conversation:
+
                 response = "analyst"
 
             elif "todavía no fueron validados" in conversation:
+
                 response = "validation"
 
             else:
+
                 response = "FINISH"
 
         # ============================================================
@@ -57,10 +72,11 @@ class MockLLM(BaseChatModel):
         elif "role: researcher" in conversation:
 
             response = (
-                "La investigación encontró que la adopción de "
-                "herramientas de inteligencia artificial aumentó un 35% "
-                "en las empresas analizadas. Además, el 62% incorporó "
-                "herramientas de automatización durante el último año."
+                "No se encontró información suficiente para responder "
+                "la consulta con el modelo simulado. "
+                "El MockLLM no dispone de acceso a fuentes externas "
+                "ni realiza búsquedas web, por lo que no debe inventar "
+                "datos o resultados de investigación."
             )
 
         # ============================================================
@@ -70,15 +86,27 @@ class MockLLM(BaseChatModel):
         elif "role: analyst" in conversation:
 
             response = (
-                "El análisis indica una tendencia positiva en la adopción "
-                "de inteligencia artificial. El promedio de los valores "
-                "analizados es 48.50. Además, la automatización está "
-                "creciendo y su impacto se concentra principalmente "
-                "en tareas repetitivas y administrativas."
+                "No es posible realizar un análisis confiable porque "
+                "la investigación no contiene información suficiente. "
+                "El modelo simulado no dispone de datos verificables "
+                "para analizar."
             )
 
         # ============================================================
-        # RESPUESTA POR DEFECTO
+        # VALIDATION
+        # ============================================================
+
+        elif "role: validation" in conversation:
+
+            response = (
+                "VALIDACIÓN: la investigación no contiene información "
+                "suficiente para respaldar una respuesta verificable. "
+                "No se consideran válidos resultados que no puedan "
+                "ser sustentados por información disponible."
+            )
+
+        # ============================================================
+        # DEFAULT
         # ============================================================
 
         else:
@@ -90,7 +118,9 @@ class MockLLM(BaseChatModel):
         return ChatResult(
             generations=[
                 ChatGeneration(
-                    message=AIMessage(content=response)
+                    message=AIMessage(
+                        content=response
+                    )
                 )
             ]
         )
@@ -103,8 +133,11 @@ class MockLLM(BaseChatModel):
 if os.getenv("OPENAI_API_KEY"):
 
     llm = ChatOpenAI(
-        model="gpt-4o",
-        temperature=0
+        model=os.getenv(
+            "OPENAI_MODEL",
+            "gpt-4o-mini",
+        ),
+        temperature=0,
     )
 
     print("🤖 Usando OpenAI LLM")
@@ -113,4 +146,7 @@ else:
 
     llm = MockLLM()
 
-    print("⚠️ Usando MockLLM (modo simulación sin API)")
+    print(
+        "⚠️ Usando MockLLM "
+        "(modo simulación sin API)"
+    )

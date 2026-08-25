@@ -1,0 +1,21 @@
+services:
+
+  redis:
+    image: redis:7-alpine
+
+    container_name: pre-entrega-7-redis
+
+    ports:
+      - "6376:6379"
+
+    volumes:
+      - redis_data:/data
+
+    command: redis-server --appendonly yes
+
+    restart: unless-stopped
+
+
+volumes:
+
+  redis_data:

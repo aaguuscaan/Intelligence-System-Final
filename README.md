@@ -1,506 +1,887 @@
-# 🤖 Pre-entrega 6: Orquestador Multi-Agente Especializado
+# 🤖 Pre-entrega 7: Sistema Multi-Agente Asíncrono con Redis y Human-in-the-Loop
 
 ## 📌 Descripción
 
-Este proyecto implementa un **Orquestador Multi-Agente de Análisis e Investigación** utilizando **LangGraph, LangChain y Python**.
+Este proyecto implementa un **sistema multi-agente asíncrono** utilizando **Python, LangGraph, LangChain, Redis y FastAPI**.
 
-El sistema recibe una consulta compleja y distribuye el trabajo entre diferentes agentes especializados.
+La arquitectura evoluciona el orquestador multi-agente de la Pre-entrega 6 incorporando:
 
-La arquitectura utiliza una **topología jerárquica**, donde un nodo **Supervisor** controla el flujo de ejecución y decide dinámicamente qué especialista debe intervenir en cada etapa.
+* 👑 **Supervisor** para coordinar el flujo.
+* 🔎 **Researcher** para investigar información.
+* 📊 **Analyst** para analizar los resultados.
+* ✅ **Validation** para verificar que el proceso esté completo.
+* 👤 **Human-in-the-Loop (HITL)** para solicitar aprobación humana antes de finalizar.
+* 🧠 **Estado persistente** mediante Redis.
+* 📥 **Redis Queue** para desacoplar la API de la ejecución.
+* 👷 **Worker asíncrono** encargado de procesar los trabajos.
+* 💾 **Redis Checkpointer** para conservar el estado de LangGraph.
+* 🔭 **Arize Phoenix** para observabilidad y trazabilidad.
+* 🌐 **FastAPI** como interfaz REST.
+* 🤖 **OpenAI / MockLLM** para permitir ejecución con o sin API.
 
-El sistema cuenta con:
-
-- 👑 **Supervisor:** controla y enruta el flujo.
-- 🔎 **Researcher:** realiza tareas de investigación utilizando una herramienta de búsqueda.
-- 📊 **Analyst:** procesa y analiza la información obtenida utilizando una herramienta de cálculo.
-- ✅ **Validation:** verifica que los resultados necesarios estén disponibles antes de finalizar.
-- 🧠 **Estado compartido:** permite conservar los resultados generados por cada agente.
-- 🔄 **Conditional Edges:** permiten que el Supervisor determine dinámicamente el siguiente nodo.
-- 🖥️ **Streaming:** permite visualizar en consola cada etapa del proceso.
-- 🤖 **OpenAI / MockLLM:** el proyecto puede ejecutarse utilizando OpenAI o un modelo simulado local sin necesidad de una API.
+La arquitectura permite que la API reciba una consulta y responda inmediatamente con un identificador de trabajo, mientras un Worker independiente ejecuta el procesamiento en segundo plano.
 
 ---
 
 # 🎯 Objetivo
 
-El objetivo de la práctica es construir un prototipo funcional de un sistema multi-agente capaz de:
+El objetivo de esta práctica es construir un sistema capaz de:
 
-1. Recibir una consulta compleja.
-2. Determinar qué especialista debe intervenir.
-3. Ejecutar una investigación.
-4. Analizar los resultados obtenidos.
-5. Validar la información.
-6. Decidir si el proceso está completo.
-7. Finalizar de forma controlada.
-
-El flujo implementado evita que todos los agentes reciban y procesen innecesariamente toda la información disponible, manteniendo una separación clara de responsabilidades.
+1. Recibir una consulta mediante una API REST.
+2. Crear un trabajo independiente.
+3. Encolar el trabajo en Redis.
+4. Procesarlo mediante un Worker asíncrono.
+5. Ejecutar un flujo multi-agente con LangGraph.
+6. Investigar la información necesaria.
+7. Analizar los resultados.
+8. Validar que el proceso esté completo.
+9. Pausar la ejecución mediante Human-in-the-Loop.
+10. Esperar una decisión humana.
+11. Reanudar el grafo utilizando el checkpoint persistido.
+12. Finalizar o rechazar el trabajo.
+13. Conservar el estado de ejecución en Redis.
+14. Registrar trazas de la ejecución mediante Phoenix.
 
 ---
 
-# 🏗️ Arquitectura
+# 🏗️ Arquitectura general
 
-La arquitectura implementada corresponde a una **topología jerárquica**.
-
-El Supervisor funciona como controlador central del flujo.
+La arquitectura combina una API REST, una cola de trabajos, un Worker, LangGraph y Redis.
 
 ```mermaid
 flowchart TD
 
-    START([Inicio])
+    CLIENT["🌐 Cliente"]
 
-    SUPERVISOR["👑 Supervisor<br/>Router dinámico"]
+    API["⚡ FastAPI"]
 
-    RESEARCHER["🔎 Researcher<br/>Investigación"]
+    REDIS_QUEUE[("📥 Redis Queue")]
 
-    ANALYST["📊 Analyst<br/>Análisis"]
+    WORKER["👷 Worker"]
 
-    VALIDATION["✅ Validation<br/>Validación"]
+    GRAPH["🧠 LangGraph"]
 
-    FINISH([🏁 FINISH])
+    SUPERVISOR["👑 Supervisor"]
 
-    START --> SUPERVISOR
+    RESEARCHER["🔎 Researcher"]
+
+    ANALYST["📊 Analyst"]
+
+    VALIDATION["✅ Validation"]
+
+    HITL["👤 Human Approval"]
+
+    CHECKPOINT[("💾 Redis Checkpointer")]
+
+    PHOENIX["🔭 Arize Phoenix"]
+
+    END(["🏁 END"])
+
+    CLIENT -->|POST /tasks| API
+
+    API -->|Guardar Job| REDIS_QUEUE
+
+    REDIS_QUEUE -->|BLPOP| WORKER
+
+    WORKER --> GRAPH
+
+    GRAPH --> SUPERVISOR
 
     SUPERVISOR -->|researcher| RESEARCHER
-    SUPERVISOR -->|analyst| ANALYST
-    SUPERVISOR -->|validation| VALIDATION
-    SUPERVISOR -->|FINISH| FINISH
-
     RESEARCHER --> SUPERVISOR
+
+    SUPERVISOR -->|analyst| ANALYST
     ANALYST --> SUPERVISOR
-    VALIDATION --> SUPERVISOR
+
+    SUPERVISOR -->|validation| VALIDATION
+
+    VALIDATION --> HITL
+
+    HITL -->|interrupt| CHECKPOINT
+
+    HITL --> END
+
+    CHECKPOINT -->|Command resume| API
+
+    API -->|Reanudar| GRAPH
+
+    GRAPH --> PHOENIX
+
+    END --> CHECKPOINT
 ```
 
-El flujo normal de ejecución es:
+---
+
+# 🔄 Flujo completo
+
+El procesamiento de un trabajo sigue el siguiente flujo:
 
 ```text
-SUPERVISOR
-    ↓
-RESEARCHER
-    ↓
-SUPERVISOR
-    ↓
-ANALYST
-    ↓
-SUPERVISOR
-    ↓
-VALIDATION
-    ↓
-SUPERVISOR
-    ↓
-FINISH
+Cliente
+   ↓
+POST /tasks
+   ↓
+FastAPI
+   ↓
+Redis Queue
+   ↓
+Worker
+   ↓
+LangGraph
+   ↓
+Supervisor
+   ↓
+Researcher
+   ↓
+Supervisor
+   ↓
+Analyst
+   ↓
+Supervisor
+   ↓
+Validation
+   ↓
+Human-in-the-Loop
+   ↓
+interrupt()
+   ↓
+Redis Checkpoint
+   ↓
+waiting_approval
+   ↓
+Aprobación humana
+   ↓
+Command(resume)
+   ↓
+LangGraph
+   ↓
+END
+```
+
+La API y el procesamiento están desacoplados.
+
+La API no ejecuta directamente el flujo completo de LangGraph al recibir una consulta.
+
+En cambio, crea un trabajo y lo coloca en una cola.
+
+---
+
+# ⚡ FastAPI
+
+FastAPI funciona como la interfaz REST del sistema.
+
+La API proporciona los siguientes endpoints:
+
+| Método | Endpoint                  | Función                 |
+| ------ | ------------------------- | ----------------------- |
+| POST   | `/tasks`                  | Crear un trabajo        |
+| GET    | `/tasks/{job_id}`         | Consultar el estado     |
+| POST   | `/tasks/{job_id}/approve` | Aprobar o rechazar HITL |
+| GET    | `/health`                 | Verificar Redis         |
+
+---
+
+# 📥 POST /tasks
+
+Este endpoint recibe una consulta:
+
+```json
+{
+    "query": "Analizá el impacto de la inteligencia artificial en el mercado laboral."
+}
+```
+
+La API genera un identificador único:
+
+```text
+job_id
+```
+
+y crea un registro en Redis:
+
+```json
+{
+    "job_id": "...",
+    "query": "...",
+    "status": "pending",
+    "result": null,
+    "error": null
+}
+```
+
+Luego agrega el `job_id` a la cola:
+
+```text
+ai_tasks_queue
+```
+
+Finalmente responde inmediatamente:
+
+```json
+{
+    "job_id": "...",
+    "status": "pending"
+}
+```
+
+La ejecución de LangGraph ocurre posteriormente en el Worker.
+
+---
+
+# 📊 Estados de un Job
+
+Un trabajo puede atravesar diferentes estados:
+
+```text
+pending
+   ↓
+running
+   ↓
+waiting_approval
+   ↓
+completed
+```
+
+También puede finalizar como:
+
+```text
+rejected
+```
+
+o:
+
+```text
+failed
+```
+
+El flujo general es:
+
+```text
+pending
+   │
+   ▼
+running
+   │
+   ├───────────────► failed
+   │
+   ▼
+waiting_approval
+   │
+   ├───────────────► rejected
+   │
+   ▼
+completed
+```
+
+---
+
+# 📥 Redis Queue
+
+Redis funciona como sistema de mensajería entre FastAPI y el Worker.
+
+La cola utilizada es:
+
+```text
+ai_tasks_queue
+```
+
+Cuando la API recibe un trabajo utiliza:
+
+```python
+await redis_client.rpush(
+    QUEUE_NAME,
+    job_id,
+)
+```
+
+El Worker consume trabajos utilizando:
+
+```python
+await redis_client.blpop(
+    QUEUE_NAME,
+    timeout=5,
+)
+```
+
+Esto permite desacoplar:
+
+```text
+API
+```
+
+de:
+
+```text
+Procesamiento
+```
+
+La API puede continuar respondiendo nuevas solicitudes mientras el Worker procesa los trabajos.
+
+---
+
+# 👷 Worker
+
+El Worker es un proceso independiente encargado de consumir trabajos de Redis.
+
+Su responsabilidad es:
+
+1. Esperar nuevos trabajos.
+2. Obtener el `job_id`.
+3. Recuperar la consulta desde Redis.
+4. Actualizar el estado a `running`.
+5. Ejecutar LangGraph.
+6. Detectar interrupciones HITL.
+7. Guardar el estado correspondiente.
+8. Marcar el trabajo como completado o fallido.
+
+El Worker se inicia mediante:
+
+```bash
+py app/worker.py
+```
+
+Su ciclo principal utiliza:
+
+```python
+BLPOP
+```
+
+para esperar nuevos trabajos sin necesidad de realizar polling constante.
+
+---
+
+# 🧠 LangGraph
+
+LangGraph controla la ejecución del sistema multi-agente.
+
+El grafo contiene los siguientes nodos:
+
+```text
+supervisor
+researcher
+analyst
+validation
+human_approval
+```
+
+El punto inicial es:
+
+```text
+supervisor
 ```
 
 ---
 
 # 👑 Supervisor
 
-El Supervisor es el componente encargado de coordinar el flujo del sistema multi-agente.
+El Supervisor es el controlador central.
 
-Su función es analizar el estado actual de la ejecución y determinar cuál debe ser el próximo agente en intervenir.
+Analiza el estado actual y determina qué componente debe intervenir.
 
-Para tomar esta decisión, el Supervisor consulta el modelo configurado en `llm.py`, que puede ser:
-
-- 🤖 `ChatOpenAI`, cuando existe una `OPENAI_API_KEY`.
-- ⚠️ `MockLLM`, cuando no se dispone de una API.
-
-El Supervisor recibe información sobre el estado actual del proceso, incluyendo:
-
-- Resultado de investigación.
-- Resultado del análisis.
-- Resultado de validación.
-
-A partir de esta información, el modelo debe seleccionar una de las siguientes opciones:
+Las opciones posibles son:
 
 ```text
 researcher
 analyst
 validation
-finish
+FINISH
 ```
+
+El Supervisor utiliza el modelo configurado en `llm.py`.
+
+El estado contiene:
+
+```text
+research_results
+analysis_results
+validation_result
+```
+
+A partir de estos valores se determina qué etapas ya fueron completadas.
+
 ---
 
 # 🔀 Routing dinámico
 
-El routing se implementa mediante `Conditional Edges` de LangGraph.
-
-La función `route_supervisor` utiliza `Literal` para definir explícitamente las rutas posibles:
+El routing se implementa utilizando `Conditional Edges`.
 
 ```python
-def route_supervisor(
-    state: AgentState,
-) -> Literal[
-    "researcher",
-    "analyst",
-    "validation",
-    "FINISH",
-]:
-    return state["next_agent"]
+workflow.add_conditional_edges(
+    "supervisor",
+    route_supervisor,
+    {
+        "researcher": "researcher",
+        "analyst": "analyst",
+        "validation": "validation",
+        "FINISH": END,
+    },
+)
 ```
 
-El Supervisor actualiza el campo:
+La función:
 
-```text
-next_agent
+```python
+route_supervisor()
 ```
 
-y LangGraph utiliza ese valor para determinar el próximo nodo.
+devuelve el siguiente nodo.
 
-De esta manera, el flujo no está definido únicamente como una secuencia fija, sino que existe una decisión centralizada que controla la ejecución.
+Esto permite mantener el control centralizado del flujo.
 
 ---
 
-# 🔎 Agente Researcher
+# 🔎 Researcher
 
-El agente `Researcher` está especializado en tareas de investigación.
+El Researcher es responsable de la etapa de investigación.
 
-Utiliza una herramienta propia llamada:
+Utiliza la herramienta:
 
 ```text
 search_knowledge_base
 ```
 
-Esta herramienta consulta una base de conocimiento simulada incluida en el proyecto.
+La herramienta consulta la base de conocimiento simulada del proyecto.
 
-La base contiene información relacionada con:
+La información disponible incluye datos relacionados con:
 
-- Inteligencia artificial.
-- Mercado laboral.
-- Empleo.
-- Productividad.
+* Inteligencia artificial.
+* Automatización.
+* Productividad.
+* Mercado laboral.
+* Empleo.
 
-Ejemplo de información disponible:
+El resultado se almacena en:
 
 ```text
-La adopción de herramientas de inteligencia artificial aumentó un 35%
-en las empresas analizadas.
-
-El 62% de las empresas incorporaron herramientas de automatización
-durante el último año.
-
-La incorporación de inteligencia artificial está modificando
-principalmente tareas repetitivas y administrativas.
-
-Las empresas que incorporaron herramientas de inteligencia artificial
-reportaron mejoras en productividad.
+research_results
 ```
 
-La herramienta está limitada a la función de búsqueda dentro de la base de conocimiento.
-
-El agente utiliza `create_react_agent` de LangGraph para interactuar con la herramienta.
+Después de completar su trabajo, el flujo vuelve al Supervisor.
 
 ---
 
-# 📊 Agente Analyst
+# 📊 Analyst
 
-El agente `Analyst` está especializado en el procesamiento y análisis de los resultados obtenidos por el Researcher.
+El Analyst procesa la información producida por Researcher.
 
-Cuenta con una herramienta propia:
+Utiliza la herramienta:
 
 ```text
 calculate_average
 ```
 
-Esta herramienta permite calcular el promedio de una lista de valores numéricos.
+Esta herramienta permite calcular el promedio de valores numéricos.
 
-Ejemplo:
-
-```text
-10, 20, 30, 40
-```
-
-Resultado:
+Por ejemplo:
 
 ```text
-El promedio de los valores analizados es 25.00.
+10
+20
+30
+40
 ```
 
-El Analyst recibe los resultados producidos por el Researcher a través del estado compartido y genera una interpretación de los datos.
+produce:
 
-También utiliza `create_react_agent`.
+```text
+25.00
+```
+
+El resultado del análisis se almacena en:
+
+```text
+analysis_results
+```
+
+Después de finalizar, el flujo vuelve al Supervisor.
 
 ---
 
 # ✅ Validation
 
-El nodo `Validation` funciona como una etapa de control antes de finalizar el proceso.
+Validation es una etapa determinística.
 
-Su objetivo es verificar que existan los resultados necesarios:
+Su objetivo es comprobar que los resultados necesarios existan:
 
 ```text
 research_results
 analysis_results
 ```
 
-Si falta alguno de estos resultados, la validación devuelve un error y el proceso no se considera terminado.
+Si alguno falta, la ejecución no puede considerarse completa.
 
-Si ambos resultados están disponibles, genera:
+Cuando ambos resultados están disponibles, Validation genera:
 
 ```text
 VALIDATION OK
 ```
 
-y marca:
-
-```text
-task_completed = True
-```
-
-Además, actualiza:
+y actualiza:
 
 ```text
 validation_result
 ```
 
-Esto permite que el Supervisor sepa que la etapa de validación ya fue completada y pueda decidir correctamente finalizar el flujo.
+La validación no depende de una decisión del LLM.
 
-La validación es determinística y no depende del LLM, lo que permite garantizar una condición de finalización clara.
-
----
-
-# 🧠 Estado compartido
-
-El estado del sistema se define en:
-
-```text
-state.py
-```
-
-El esquema hereda de `MessagesState` de LangGraph.
-
-```python
-class AgentState(MessagesState):
-
-    research_results: Optional[str]
-
-    analysis_results: Optional[str]
-
-    validation_result: Optional[str]
-
-    next_agent: Optional[str]
-
-    supervisor_reason: Optional[str]
-
-    task_completed: bool
-```
-
-## Campos principales
-
-### `messages`
-
-Hereda de `MessagesState` y permite conservar los mensajes de la ejecución.
-
-### `research_results`
-
-Almacena el resultado generado por el agente Researcher.
-
-### `analysis_results`
-
-Almacena el resultado generado por el agente Analyst.
-
-### `validation_result`
-
-Almacena el resultado de la etapa de validación.
-
-### `next_agent`
-
-Indica qué nodo debe ejecutarse a continuación.
-
-### `supervisor_reason`
-
-Permite conservar una explicación de la decisión tomada por el Supervisor.
-
-### `task_completed`
-
-Indica si el proceso fue completado correctamente.
-
-Este estado compartido permite que los diferentes componentes del grafo trabajen sobre una estructura común sin perder los resultados producidos por los agentes anteriores.
+Esto proporciona una condición de finalización controlada.
 
 ---
 
-# 🤖 OpenAI y MockLLM
+# 👤 Human-in-the-Loop
 
-El proyecto puede funcionar utilizando dos modalidades.
+Una de las principales incorporaciones de esta pre-entrega es el mecanismo de **Human-in-the-Loop**.
 
-## OpenAI
-
-Si existe la variable de entorno:
+Después de que Researcher, Analyst y Validation terminan, el sistema llega al nodo:
 
 ```text
-OPENAI_API_KEY
+human_approval
 ```
 
-el sistema utiliza:
+Este nodo utiliza:
 
 ```python
-ChatOpenAI(
-    model="gpt-4o",
-    temperature=0
+interrupt()
+```
+
+La interrupción contiene información para el usuario:
+
+```python
+approval = interrupt(
+    {
+        "type": "human_approval",
+        "message": (
+            "La tarea fue investigada, analizada "
+            "y validada. Se requiere aprobación "
+            "humana para finalizar."
+        ),
+    }
 )
 ```
 
-Esto permite ejecutar el sistema utilizando un modelo real de OpenAI.
+En este punto LangGraph pausa la ejecución.
+
+El estado queda persistido mediante el checkpointer.
 
 ---
 
-## MockLLM
+# ⏸️ Estado waiting_approval
 
-Si no existe `OPENAI_API_KEY`, el sistema utiliza un `MockLLM` desarrollado específicamente para esta pre-entrega.
-
-En ese caso aparece:
+Cuando el Worker detecta:
 
 ```text
-⚠️ Usando MockLLM (modo simulación sin API)
+__interrupt__
 ```
 
-El MockLLM reproduce las respuestas necesarias para demostrar el funcionamiento completo del sistema.
+actualiza Redis:
 
-Esto permite ejecutar y probar el proyecto sin necesidad de disponer de una API externa.
-
-El MockLLM contempla los diferentes roles del sistema:
-
-```text
-SUPERVISOR
-RESEARCHER
-ANALYST
+```json
+{
+    "status": "waiting_approval"
+}
 ```
 
-De esta manera se puede demostrar la arquitectura multi-agente incluso sin credenciales externas.
+Esto permite que la API pueda informar que el trabajo está esperando una decisión humana.
+
+El Worker no vuelve a ejecutar el trabajo desde cero.
+
+La ejecución queda pausada.
 
 ---
 
-# 📡 Streaming
+# ✔️ Aprobación humana
 
-La ejecución principal utiliza:
+La decisión se envía mediante:
+
+```text
+POST /tasks/{job_id}/approve
+```
+
+con:
+
+```json
+{
+    "approved": true
+}
+```
+
+La API utiliza:
 
 ```python
-app.astream(initial_state)
+Command(
+    resume=request.approved
+)
 ```
 
-Esto permite visualizar progresivamente el flujo del grafo.
+junto con el mismo:
 
-La consola muestra cada nodo ejecutado y el resultado producido.
+```text
+thread_id = job_id
+```
+
+Esto permite recuperar el checkpoint correspondiente y continuar la ejecución.
+
+---
+
+# ❌ Rechazo humano
+
+También es posible rechazar la ejecución:
+
+```json
+{
+    "approved": false
+}
+```
+
+El nodo HITL recibe:
+
+```python
+False
+```
+
+y devuelve:
+
+```python
+{
+    "human_approved": False,
+    "task_completed": False,
+}
+```
+
+La API marca el trabajo como:
+
+```text
+rejected
+```
+
+---
+
+# 💾 Persistencia
+
+El sistema utiliza Redis para dos responsabilidades diferentes.
+
+## Redis como Queue
+
+Almacena trabajos pendientes:
+
+```text
+ai_tasks_queue
+```
+
+## Redis como almacenamiento de estados
+
+Almacena información del Job:
+
+```text
+task_status:{job_id}
+```
+
+## Redis como Checkpointer de LangGraph
+
+LangGraph utiliza:
+
+```python
+AsyncRedisSaver
+```
+
+para almacenar checkpoints de la ejecución.
+
+El grafo se compila con:
+
+```python
+app = workflow.compile(
+    checkpointer=checkpointer
+)
+```
+
+Esto permite recuperar el estado asociado al:
+
+```text
+thread_id
+```
+
+y es especialmente importante para Human-in-the-Loop.
+
+Los checkpointers de LangGraph guardan snapshots del estado del grafo y permiten ejecución durable y reanudación de flujos interrumpidos.
+
+---
+
+# 🔐 Thread ID
+
+Cada Job recibe un UUID:
+
+```python
+job_id = str(uuid.uuid4())
+```
+
+Ese identificador se utiliza también como:
+
+```text
+thread_id
+```
 
 Ejemplo:
 
-```text
-👑 SUPERVISOR
-   └── Próximo agente: researcher
-
-🔎 RESEARCHER
-   └── Investigación completada
-
-👑 SUPERVISOR
-   └── Próximo agente: analyst
-
-📊 ANALYST
-   └── Análisis completado
-
-👑 SUPERVISOR
-   └── Próximo agente: validation
-
-✅ VALIDATION
-   ├── Investigación: OK
-   ├── Análisis: OK
-   └── Estado: VÁLIDO
-
-👑 SUPERVISOR
-   └── Próximo agente: FINISH
+```python
+config = {
+    "configurable": {
+        "thread_id": job_id,
+    }
+}
 ```
 
-Esto permite observar claramente la delegación de tareas y el retorno de cada especialista al Supervisor.
+Esto conecta:
+
+```text
+Job
+  ↓
+Redis
+  ↓
+LangGraph
+  ↓
+Checkpoint
+  ↓
+Human Approval
+  ↓
+Resume
+```
+
+El mismo `thread_id` permite que la ejecución pueda continuar desde el punto donde fue interrumpida.
 
 ---
 
-# 🛑 Prevención de bucles infinitos
+# 🔭 Observabilidad con Arize Phoenix
 
-Uno de los riesgos de una arquitectura con Supervisor es generar un ciclo infinito.
+El proyecto incorpora **Arize Phoenix** para observar las ejecuciones de LangChain/LangGraph.
 
-Para evitarlo, el proyecto utiliza diferentes mecanismos:
-
-1. El estado permite conocer qué etapas ya fueron completadas.
-2. El Supervisor verifica la existencia de `research_results`, `analysis_results` y `validation_result`.
-3. Validation actualiza `validation_result` cuando finaliza correctamente.
-4. El Supervisor solamente puede seleccionar cuatro opciones válidas.
-5. Existe un fallback determinístico si el LLM devuelve una respuesta inesperada.
-6. Cuando todos los resultados están disponibles, el Supervisor devuelve `FINISH`.
-7. `FINISH` está conectado directamente con `END`.
-
-El flujo de finalización es:
+La configuración se encuentra en:
 
 ```text
-Validation
-    ↓
+app/observability.py
+```
+
+Se registra un `TracerProvider` mediante:
+
+```python
+register(
+    project_name=PHOENIX_PROJECT,
+    endpoint=PHOENIX_ENDPOINT,
+    auto_instrument=False,
+    batch=False,
+)
+```
+
+Luego se activa:
+
+```python
+LangChainInstrumentor().instrument(
+    tracer_provider=_tracer_provider
+)
+```
+
+Esto permite visualizar las trazas generadas durante la ejecución.
+
+---
+
+# 📊 Phoenix
+
+La configuración utilizada es:
+
+```env
+PHOENIX_ENDPOINT=http://localhost:6006/v1/traces
+PHOENIX_PROJECT=pre-entrega-7
+```
+
+La interfaz de Phoenix queda disponible en:
+
+```text
+http://localhost:6006
+```
+
+El proyecto incluye evidencias visuales:
+
+```text
+screenshots/
+├── phoenix-researcher.png
+└── phoenix-trace.png
+```
+
+Estas capturas muestran la instrumentación y las trazas generadas durante la ejecución del sistema.
+
+---
+
+# 🧠 OpenAI / MockLLM
+
+El proyecto mantiene compatibilidad con dos modalidades.
+
+## OpenAI
+
+Cuando existe:
+
+```env
+OPENAI_API_KEY=...
+```
+
+se utiliza el modelo configurado en:
+
+```text
+app/llm.py
+```
+
+## MockLLM
+
+Cuando no existe una API configurada, el proyecto puede utilizar un modelo simulado.
+
+Esto permite ejecutar la arquitectura sin depender obligatoriamente de una API externa.
+
+El objetivo del MockLLM es permitir probar:
+
+```text
 Supervisor
-    ↓
-FINISH
-    ↓
-END
+Researcher
+Analyst
 ```
 
-Por lo tanto, no existe un ciclo permanente entre Supervisor y Validation.
-
----
-
-# 🔄 Manejo de contexto
-
-El sistema utiliza un estado compartido estructurado para conservar únicamente la información necesaria para cada etapa.
-
-El Researcher produce:
-
-```text
-research_results
-```
-
-El Analyst utiliza ese resultado para producir:
-
-```text
-analysis_results
-```
-
-Validation verifica ambos resultados y genera:
-
-```text
-validation_result
-```
-
-El Supervisor utiliza estos campos para decidir el siguiente paso.
-
-De esta forma, cada agente tiene una responsabilidad concreta y el estado permite mantener la continuidad de la ejecución.
-
----
-
-# ⚔️ Manejo de conflictos
-
-La arquitectura no permite que los especialistas decidan directamente el flujo global.
-
-Los agentes especializados producen resultados, pero el control permanece centralizado en el Supervisor.
-
-Esto evita que un agente pueda modificar directamente la ruta global del grafo.
-
-La etapa de Validation funciona además como una barrera antes de finalizar.
-
-En caso de resultados incompletos, el sistema no permite finalizar correctamente.
+sin necesidad de credenciales externas.
 
 ---
 
 # 📁 Estructura del proyecto
 
 ```text
-pre-entrega-6/
+pre-entrega-7/
 │
-├── agents/
+├── app/
+│   │
+│   ├── agents/
+│   │   ├── __init__.py
+│   │   ├── research_agent.py
+│   │   ├── analyst_agent.py
+│   │   └── validation_agent.py
+│   │
 │   ├── __init__.py
-│   ├── research_agent.py
-│   ├── analyst_agent.py
-│   └── validation_agent.py
+│   ├── graph.py
+│   ├── hitl.py
+│   ├── llm.py
+│   ├── main.py
+│   ├── observability.py
+│   ├── redis_client.py
+│   ├── state.py
+│   ├── test_hitl.py
+│   ├── test_persistence.py
+│   └── worker.py
 │
-├── graph.py
-├── llm.py
-├── main.py
-├── state.py
-├── requirements.txt
+├── screenshots/
+│   ├── phoenix-researcher.png
+│   └── phoenix-trace.png
+│
+├── .env
 ├── .env.example
 ├── .gitignore
+├── docker-compose.yml
+├── phoenix_setup.py
+├── pytest.ini
+├── requirements.txt
 └── README.md
 ```
 
@@ -508,62 +889,143 @@ pre-entrega-6/
 
 # 📄 Descripción de archivos
 
-## `state.py`
+## `app/graph.py`
 
-Define el estado compartido del sistema utilizando `MessagesState`.
+Contiene la arquitectura principal de LangGraph:
+
+* Supervisor.
+* Researcher.
+* Analyst.
+* Validation.
+* Human Approval.
+* Conditional Edges.
+* Redis Checkpointer.
+* `interrupt()`.
+* Compilación del grafo.
 
 ---
 
-## `graph.py`
+## `app/worker.py`
+
+Implementa el Worker.
+
+Sus responsabilidades son:
+
+* Consumir Redis Queue.
+* Ejecutar LangGraph.
+* Actualizar estados.
+* Detectar interrupciones.
+* Guardar trabajos pendientes de aprobación.
+* Gestionar errores.
+
+---
+
+## `app/main.py`
+
+Implementa la API REST utilizando FastAPI.
 
 Contiene:
 
-- Supervisor.
-- Routing dinámico.
-- Conditional Edges.
-- Nodos de los agentes.
-- Compilación del `StateGraph`.
+```text
+POST /tasks
+GET /tasks/{job_id}
+POST /tasks/{job_id}/approve
+GET /health
+```
 
 ---
 
-## `main.py`
+## `app/llm.py`
 
-Ejecuta el orquestador y muestra el flujo mediante streaming.
+Gestiona la selección del modelo:
 
----
+```text
+OpenAI
+```
 
-## `llm.py`
+o:
 
-Gestiona la selección entre:
-
-- OpenAI.
-- MockLLM.
-
----
-
-## `agents/research_agent.py`
-
-Contiene:
-
-- Researcher.
-- `search_knowledge_base`.
-- `research_node`.
+```text
+MockLLM
+```
 
 ---
 
-## `agents/analyst_agent.py`
+## `app/state.py`
 
-Contiene:
+Define el estado compartido utilizado por LangGraph.
 
-- Analyst.
-- `calculate_average`.
-- `analyst_node`.
+Incluye los resultados de cada etapa y la información necesaria para controlar el flujo.
 
 ---
 
-## `agents/validation_agent.py`
+## `app/observability.py`
 
-Contiene el nodo determinístico de validación.
+Configura:
+
+```text
+Arize Phoenix
+OpenTelemetry
+OpenInference
+```
+
+---
+
+## `app/redis_client.py`
+
+Centraliza la configuración de Redis utilizada por el proyecto.
+
+---
+
+## `app/test_hitl.py`
+
+Contiene pruebas relacionadas con el mecanismo Human-in-the-Loop.
+
+---
+
+## `app/test_persistence.py`
+
+Contiene pruebas relacionadas con la persistencia del estado.
+
+---
+
+# 🐳 Redis con Docker
+
+Redis se ejecuta mediante Docker Compose.
+
+El archivo:
+
+```text
+docker-compose.yml
+```
+
+define:
+
+```yaml
+services:
+
+  redis:
+    image: redis:7-alpine
+    container_name: pre-entrega-7-redis
+    ports:
+      - "6376:6379"
+    volumes:
+      - redis_data:/data
+    command: redis-server --appendonly yes
+    restart: unless-stopped
+```
+
+El puerto utilizado desde la aplicación es:
+
+```text
+6376
+```
+
+mientras que Redis escucha internamente en:
+
+```text
+6379
+```
 
 ---
 
@@ -578,12 +1040,12 @@ git clone <URL_DEL_REPOSITORIO>
 Entrar al proyecto:
 
 ```bash
-cd pre-entrega-6
+cd pre-entrega-7
 ```
 
 ---
 
-## 2. Crear entorno virtual
+# 2. Crear entorno virtual
 
 En Windows:
 
@@ -591,7 +1053,7 @@ En Windows:
 py -m venv venv
 ```
 
-Activarlo:
+Activar:
 
 ```bash
 venv\Scripts\activate
@@ -599,19 +1061,41 @@ venv\Scripts\activate
 
 ---
 
-## 3. Instalar dependencias
+# 3. Instalar dependencias
 
 ```bash
 py -m pip install -r requirements.txt
 ```
 
+Las dependencias principales incluyen:
+
+```text
+fastapi
+uvicorn
+pydantic
+python-dotenv
+redis
+langgraph
+langgraph-checkpoint-redis
+langchain
+langchain-core
+langchain-openai
+langsmith
+typing-extensions
+```
+
+Para la observabilidad también deben estar instaladas las dependencias utilizadas por:
+
+```text
+phoenix.otel
+openinference.instrumentation.langchain
+```
+
 ---
 
-# 🔐 Configuración de OpenAI
+# 🔐 Configuración
 
-El proyecto no requiere obligatoriamente una API de OpenAI.
-
-Para utilizar OpenAI, crear un archivo:
+Crear un archivo:
 
 ```text
 .env
@@ -619,252 +1103,584 @@ Para utilizar OpenAI, crear un archivo:
 
 con:
 
-```text
+```env
+REDIS_URL=redis://localhost:6376
+
+QUEUE_NAME=ai_tasks_queue
+
+STATUS_PREFIX=task_status:
+
+PHOENIX_ENDPOINT=http://localhost:6006/v1/traces
+
+PHOENIX_PROJECT=pre-entrega-7
+```
+
+Si se desea utilizar OpenAI:
+
+```env
 OPENAI_API_KEY=tu_api_key
 ```
 
-También se incluye:
-
-```text
-.env.example
-```
-
-como referencia.
-
-Nunca se debe subir el archivo `.env` al repositorio.
+El archivo `.env` no debe subirse al repositorio.
 
 ---
 
 # ▶️ Ejecución
 
-Una vez instaladas las dependencias:
+La arquitectura requiere varios procesos.
+
+## 1. Iniciar Redis
+
+Desde la raíz:
 
 ```bash
-py main.py
+docker compose up -d
 ```
 
-Si no existe `OPENAI_API_KEY`, se utilizará automáticamente:
+Verificar:
 
-```text
-MockLLM
+```bash
+docker ps
 ```
 
-Si existe la variable, se utilizará:
+Debe aparecer:
 
 ```text
-OpenAI
+pre-entrega-7-redis
 ```
 
 ---
 
-# 🧪 Ejemplo de ejecución
+# 2. Iniciar Phoenix
 
-Consulta utilizada:
+Iniciar Arize Phoenix en el puerto configurado:
 
 ```text
-Analizá el impacto de la inteligencia artificial
-en el mercado laboral y elaborá una conclusión.
+6006
 ```
 
-Flujo obtenido:
+Luego acceder a:
+
+```text
+http://localhost:6006
+```
+
+---
+
+# 3. Iniciar Worker
+
+En una terminal:
+
+```bash
+py app/worker.py
+```
+
+Debe aparecer:
 
 ```text
 ============================================================
-🚀 ORQUESTADOR MULTI-AGENTE
+👷 WORKER INICIADO
 ============================================================
+```
 
+También debería mostrar:
+
+```text
+🔭 Observabilidad: Phoenix ACTIVO
+```
+
+y:
+
+```text
+✅ RedisSaver configurado.
+```
+
+---
+
+# 4. Iniciar FastAPI
+
+En otra terminal:
+
+```bash
+uvicorn app.main:app --reload
+```
+
+La API estará disponible en:
+
+```text
+http://127.0.0.1:8000
+```
+
+La documentación interactiva puede consultarse mediante Swagger.
+
+---
+
+# 🧪 Demo
+
+La demostración completa consiste en crear un trabajo y observar cómo atraviesa todo el sistema.
+
+---
+
+## Paso 1 — Crear un Job
+
+Enviar:
+
+```http
+POST /tasks
+```
+
+con:
+
+```json
+{
+    "query": "Analizá el impacto de la inteligencia artificial en el mercado laboral."
+}
+```
+
+La API devuelve:
+
+```json
+{
+    "job_id": "UUID",
+    "status": "pending"
+}
+```
+
+---
+
+# Paso 2 — Worker
+
+El Worker detecta:
+
+```text
+📥 Nuevo Job recibido
+```
+
+y cambia el estado:
+
+```text
+pending
+↓
+running
+```
+
+---
+
+# Paso 3 — LangGraph
+
+El Supervisor decide:
+
+```text
 👑 SUPERVISOR
-   └── Próximo agente: researcher
+└── Próximo agente: researcher
+```
 
+Researcher ejecuta:
+
+```text
 🔎 RESEARCHER
-   └── Investigación completada
-   └── Resultado:
-       La investigación encontró que la adopción de
-       herramientas de inteligencia artificial aumentó
-       un 35% en las empresas analizadas.
-       Además, el 62% incorporó herramientas de
-       automatización durante el último año.
-
-👑 SUPERVISOR
-   └── Próximo agente: analyst
-
-📊 ANALYST
-   └── Análisis completado
-   └── Resultado:
-       El análisis indica una tendencia positiva en
-       la adopción de inteligencia artificial.
-       El promedio de los valores analizados es 48.50.
-       Además, la automatización está creciendo y su
-       impacto se concentra principalmente en tareas
-       repetitivas y administrativas.
-
-👑 SUPERVISOR
-   └── Próximo agente: validation
-
-✅ VALIDATION
-   ├── Investigación: OK
-   ├── Análisis: OK
-   └── Estado: VÁLIDO
-
-👑 SUPERVISOR
-   └── Próximo agente: FINISH
-
-============================================================
-✅ PROCESO FINALIZADO
-============================================================
+└── Investigación completada
 ```
 
 ---
 
-# 📊 Flujo de delegación
+# Paso 4 — Analyst
 
-La consulta inicial no es resuelta por un único agente.
-
-El Supervisor coordina las diferentes especializaciones:
+El Supervisor vuelve a intervenir:
 
 ```text
-Consulta del usuario
-        │
-        ▼
-   SUPERVISOR
-        │
-        ▼
-   RESEARCHER
-        │
-        │ investigación
-        ▼
-   SUPERVISOR
-        │
-        ▼
-    ANALYST
-        │
-        │ análisis
-        ▼
-   SUPERVISOR
-        │
-        ▼
-   VALIDATION
-        │
-        │ validación
-        ▼
-   SUPERVISOR
-        │
-        ▼
-     FINISH
+👑 SUPERVISOR
+└── Próximo agente: analyst
 ```
 
-Este flujo demuestra la delegación jerárquica y la comunicación mediante el estado compartido.
+Analyst procesa los resultados:
+
+```text
+📊 ANALYST
+└── Análisis completado
+```
 
 ---
 
-# 🎥 Demo
+# Paso 5 — Validation
 
-El proyecto incluye una demostración del flujo de delegación mediante la ejecución de `main.py`.
+El Supervisor selecciona:
 
-La demostración muestra:
+```text
+validation
+```
 
-1. La consulta inicial.
-2. La decisión del Supervisor.
-3. La ejecución del Researcher.
-4. El retorno al Supervisor.
-5. La ejecución del Analyst.
-6. El retorno al Supervisor.
-7. La ejecución de Validation.
-8. La validación de los resultados.
-9. La decisión final del Supervisor.
-10. La finalización del grafo.
+Validation verifica:
+
+```text
+Investigación: OK
+Análisis: OK
+```
+
+y genera:
+
+```text
+VALIDATION OK
+```
+
+---
+
+# Paso 6 — Human-in-the-Loop
+
+El grafo llega a:
+
+```text
+human_approval
+```
+
+y ejecuta:
+
+```python
+interrupt(...)
+```
+
+El Worker detecta:
+
+```text
+⏸️ LANGGRAPH PAUSADO
+```
+
+y actualiza Redis:
+
+```text
+waiting_approval
+```
+
+En este punto el trabajo permanece pausado.
+
+---
+
+# Paso 7 — Consultar estado
+
+Utilizar:
+
+```http
+GET /tasks/{job_id}
+```
+
+La respuesta debe indicar:
+
+```json
+{
+    "job_id": "...",
+    "status": "waiting_approval",
+    "result": "La tarea requiere aprobación humana."
+}
+```
+
+---
+
+# Paso 8 — Aprobar
+
+Enviar:
+
+```http
+POST /tasks/{job_id}/approve
+```
+
+con:
+
+```json
+{
+    "approved": true
+}
+```
+
+La API ejecuta:
+
+```python
+Command(
+    resume=True
+)
+```
+
+utilizando el mismo:
+
+```text
+thread_id
+```
+
+LangGraph recupera el checkpoint y continúa la ejecución.
+
+---
+
+# Paso 9 — Finalización
+
+Si la aprobación es positiva:
+
+```text
+human_approval
+      ↓
+END
+```
+
+y Redis registra:
+
+```text
+completed
+```
+
+---
+
+# ❌ Demo de rechazo
+
+También puede probarse:
+
+```json
+{
+    "approved": false
+}
+```
+
+El resultado esperado es:
+
+```text
+rejected
+```
+
+Esto demuestra que la decisión humana modifica el resultado final de la ejecución.
+
+---
+
+# 🔭 Evidencia de observabilidad
+
+Durante la ejecución se pueden observar las trazas en Phoenix.
+
+El proyecto incluye:
+
+```text
+screenshots/phoenix-researcher.png
+```
+
+y:
+
+```text
+screenshots/phoenix-trace.png
+```
+
+Estas evidencias permiten demostrar la instrumentación del flujo multi-agente.
+
+---
+
+# 🧪 Pruebas
+
+El proyecto incluye pruebas específicas para:
+
+```text
+test_hitl.py
+```
+
+y:
+
+```text
+test_persistence.py
+```
+
+Las pruebas permiten verificar:
+
+* Interrupción HITL.
+* Reanudación.
+* Persistencia.
+* Estado del grafo.
+* Uso del checkpoint.
+
+Ejecutar:
+
+```bash
+pytest
+```
+
+---
+
+# 🛡️ Manejo de errores
+
+El Worker captura excepciones durante la ejecución:
+
+```python
+except Exception as error:
+```
+
+y actualiza el Job:
+
+```text
+failed
+```
+
+almacenando también:
+
+```text
+error
+```
+
+Esto permite que la API pueda informar el fallo sin perder el registro del trabajo.
+
+---
+
+# 🔄 Desacoplamiento
+
+Una de las principales características de la arquitectura es el desacoplamiento entre API y procesamiento.
+
+```text
+                 ┌───────────────┐
+                 │    FastAPI    │
+                 └───────┬───────┘
+                         │
+                         ▼
+                 ┌───────────────┐
+                 │     Redis     │
+                 │     Queue     │
+                 └───────┬───────┘
+                         │
+                         ▼
+                 ┌───────────────┐
+                 │    Worker     │
+                 └───────┬───────┘
+                         │
+                         ▼
+                 ┌───────────────┐
+                 │   LangGraph   │
+                 └───────────────┘
+```
+
+Esto permite que el procesamiento pueda evolucionar independientemente de la API.
 
 ---
 
 # 🧩 Tecnologías utilizadas
 
-- **Python 3.12**
-- **LangGraph**
-- **LangChain**
-- **LangChain OpenAI**
-- **Pydantic / Typed State**
-- **OpenAI API** — opcional
-- **MockLLM** — ejecución sin API
+| Tecnología         | Responsabilidad           |
+| ------------------ | ------------------------- |
+| Python 3.12        | Lenguaje principal        |
+| FastAPI            | API REST                  |
+| Uvicorn            | Servidor ASGI             |
+| LangGraph          | Orquestación del grafo    |
+| LangChain          | Framework de agentes      |
+| OpenAI             | LLM opcional              |
+| MockLLM            | Ejecución sin API         |
+| Redis              | Cola y persistencia       |
+| Redis Checkpointer | Persistencia de LangGraph |
+| Docker             | Infraestructura Redis     |
+| Arize Phoenix      | Observabilidad            |
+| OpenInference      | Instrumentación           |
+| Pydantic           | Validación de datos       |
+| pytest             | Testing                   |
 
 ---
 
 # 🎓 Relación con los criterios de evaluación
 
-## Documentación y Visualización — 20%
+## Arquitectura
 
-El README documenta:
+El proyecto implementa:
 
-- La topología utilizada.
-- El funcionamiento del Supervisor.
-- Los agentes especializados.
-- El flujo de delegación.
-- El estado compartido.
-- La estrategia de validación.
-- El diagrama Mermaid del grafo.
+* Arquitectura multi-agente.
+* Supervisor.
+* Conditional Edges.
+* Routing dinámico.
+* Estado compartido.
+* Redis Queue.
+* Worker.
+* API REST.
+* Persistencia.
 
 ---
 
-## Arquitectura y Flujo del Grafo — 35%
+## Especialización
+
+Los agentes poseen responsabilidades separadas:
+
+```text
+Researcher
+    ↓
+Investigación
+
+Analyst
+    ↓
+Análisis
+
+Validation
+    ↓
+Validación
+```
+
+El Supervisor mantiene el control del flujo global.
+
+---
+
+## Persistencia
 
 El proyecto utiliza:
 
-- `StateGraph`.
-- Nodo Supervisor.
-- Conditional Edges.
-- Routing dinámico.
-- `Literal`.
-- Estado compartido.
-- Condición explícita de finalización.
+```text
+Redis
++
+AsyncRedisSaver
++
+thread_id
+```
 
-El Supervisor funciona como controlador central de la ejecución.
+para conservar el estado del grafo.
+
+Esto resulta especialmente importante para Human-in-the-Loop.
 
 ---
 
-## Especialización de Agentes y Herramientas — 25%
+## Human-in-the-Loop
 
-Se implementan dos agentes especializados:
+La ejecución incorpora:
 
-### Researcher
-
-Herramienta:
-
-```text
-search_knowledge_base
+```python
+interrupt()
 ```
 
-### Analyst
+para pausar el grafo y:
 
-Herramienta:
-
-```text
-calculate_average
+```python
+Command(
+    resume=...
+)
 ```
 
-Cada agente posee una responsabilidad específica dentro del flujo.
+para reanudarlo después de recibir una decisión humana.
 
 ---
 
-## Gestión de Estado y Validación — 20%
+## Observabilidad
 
-El estado compartido se define en:
+La ejecución se instrumenta mediante:
 
 ```text
-state.py
+OpenTelemetry
++
+OpenInference
++
+Arize Phoenix
 ```
 
-y contiene los resultados de cada etapa.
-
-Además, existe un nodo `Validation` que verifica la existencia de los resultados necesarios antes de permitir la finalización.
+permitiendo inspeccionar las trazas generadas por los agentes.
 
 ---
 
 # 🚀 Conclusión
 
-Este proyecto implementa un **Orquestador Multi-Agente especializado** capaz de distribuir una tarea compleja entre diferentes agentes, conservar los resultados mediante un estado compartido y controlar dinámicamente el flujo mediante un Supervisor.
+La Pre-entrega 7 evoluciona el sistema multi-agente anterior hacia una arquitectura asíncrona y persistente.
 
 La combinación de:
 
 ```text
+FastAPI
++
+Redis Queue
++
+Worker
++
+LangGraph
++
 Supervisor
 +
 Researcher
@@ -873,16 +1689,22 @@ Analyst
 +
 Validation
 +
-Shared State
+Human-in-the-Loop
 +
-Conditional Routing
+Redis Checkpointer
 +
-MockLLM / OpenAI
+Arize Phoenix
 ```
 
-permite construir un flujo modular, controlado y reproducible.
+permite construir un sistema capaz de recibir trabajos, procesarlos de forma desacoplada, conservar su estado y solicitar intervención humana antes de finalizar.
 
-El sistema puede ejecutarse sin API mediante `MockLLM` o utilizar un modelo real de OpenAI cuando se configura `OPENAI_API_KEY`.
+El uso de Redis permite separar la recepción de solicitudes de la ejecución.
+
+LangGraph administra el flujo multi-agente y la persistencia de los checkpoints.
+
+El mecanismo Human-in-the-Loop permite pausar la ejecución mediante `interrupt()` y reanudarla posteriormente mediante `Command(resume=...)`.
+
+Finalmente, Arize Phoenix permite observar las trazas producidas durante la ejecución.
 
 ---
 
@@ -890,4 +1712,6 @@ El sistema puede ejecutarse sin API mediante `MockLLM` o utilizar un modelo real
 
 **Agustina Esteban**
 
-Proyecto desarrollado como parte de la **Pre-entrega 6 — Orquestador Multi-Agente Especializado**.
+Proyecto desarrollado como parte de la:
+
+**Pre-entrega 7 — Sistema Multi-Agente Asíncrono con Redis, Persistencia y Human-in-the-Loop**

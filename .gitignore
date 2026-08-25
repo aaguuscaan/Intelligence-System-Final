@@ -1,5 +1,22 @@
-.env
-__pycache__/
-*.pyc
-.venv/
+# Entorno virtual
 venv/
+.venv/
+
+# Variables de entorno
+.env
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# IDE
+.vscode/
+.idea/
+
+# Logs
+*.log
+
+# Sistema
+.DS_Store
+Thumbs.db
