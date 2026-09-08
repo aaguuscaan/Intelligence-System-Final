@@ -6,24 +6,18 @@ from langgraph.graph import MessagesState
 class AgentState(MessagesState):
     """
     Estado compartido del sistema multi-agente.
-
-    Hereda de MessagesState para conservar correctamente
-    los mensajes de la ejecución de LangGraph.
-
-    El estado también contiene los resultados producidos
-    por cada especialista y el estado de aprobación humana.
     """
 
-    research_results: Optional[str]
+    research_results: Optional[str] = None
 
-    analysis_results: Optional[str]
+    analysis_results: Optional[str] = None
 
-    validation_result: Optional[str]
+    validation_result: Optional[str] = None
 
-    next_agent: Optional[str]
+    next_agent: Optional[str] = None
 
-    supervisor_reason: Optional[str]
+    supervisor_reason: Optional[str] = None
 
-    human_approved: Optional[bool]
+    human_approved: Optional[bool] = None
 
-    task_completed: bool
+    task_completed: bool = False

@@ -7,10 +7,9 @@ from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field, ConfigDict
 
 from redis import asyncio as aioredis
-
 from langgraph.types import Command
 
 
@@ -62,7 +61,7 @@ app = FastAPI(
         "multi-agente con LangGraph, Redis, "
         "Worker y Human-in-the-loop."
     ),
-    version="2.0.0",
+    version="2.1.0",
 )
 
 
@@ -80,20 +79,92 @@ app.add_middleware(
 
 
 # ================================================================
-# MODELOS
+# MODELOS PYDANTIC
 # ================================================================
 
+
 class TaskRequest(BaseModel):
-    query: str
+    """
+    Input para crear una nueva tarea.
+    """
+
+    query: str = Field(
+        ...,
+        min_length=1,
+        description="Consulta que será procesada por el sistema multi-agente.",
+        examples=["¿Qué es un sistema RAG?"],
+    )
 
 
 class TaskResponse(BaseModel):
-    job_id: str
-    status: str
+    """
+    Respuesta al crear una tarea.
+    """
+
+    job_id: str = Field(
+        ...,
+        description="Identificador único de la tarea.",
+    )
+
+    status: str = Field(
+        ...,
+        description="Estado actual de la tarea.",
+    )
 
 
 class ApprovalRequest(BaseModel):
-    approved: bool
+    """
+    Input para la aprobación humana.
+    """
+
+    approved: bool = Field(
+        ...,
+        description="Indica si la ejecución fue aprobada.",
+    )
+
+
+class TaskStatusResponse(BaseModel):
+    """
+    Estado completo de una tarea.
+    """
+
+    job_id: str
+
+    query: str
+
+    status: str
+
+    result: str | None = None
+
+    error: str | None = None
+
+
+class ApprovalResponse(BaseModel):
+    """
+    Resultado de una decisión Human-in-the-loop.
+    """
+
+    job_id: str
+
+    status: str
+
+    human_approved: bool
+
+    task_completed: bool
+
+    result: str | None = None
+
+
+class HealthResponse(BaseModel):
+    """
+    Estado de salud de la API.
+    """
+
+    status: str
+
+    redis: str
+
+    error: str | None = None
 
 
 # ================================================================
@@ -106,33 +177,32 @@ class ApprovalRequest(BaseModel):
 )
 async def create_task(
     request: TaskRequest,
-):
-    """
-    Crea un nuevo trabajo y lo coloca en Redis.
+) -> TaskResponse:
 
-    El endpoint no ejecuta LangGraph directamente.
-    El Worker será responsable de procesarlo.
-    """
+    query = request.query.strip()
 
-    if not request.query.strip():
+    if not query:
+
         raise HTTPException(
             status_code=400,
             detail="La consulta no puede estar vacía.",
         )
 
-    job_id = str(uuid.uuid4())
+    job_id = str(
+        uuid.uuid4()
+    )
 
     task_data = {
         "job_id": job_id,
-        "query": request.query,
+        "query": query,
         "status": "pending",
         "result": None,
         "error": None,
     }
 
-    # ------------------------------------------------------------
-    # GUARDAR ESTADO
-    # ------------------------------------------------------------
+    # ============================================================
+    # GUARDAR JOB EN REDIS
+    # ============================================================
 
     await redis_client.set(
         f"{STATUS_PREFIX}{job_id}",
@@ -142,18 +212,33 @@ async def create_task(
         ),
     )
 
-    # ------------------------------------------------------------
+    # ============================================================
     # ENCOLAR JOB
-    # ------------------------------------------------------------
+    # ============================================================
 
     await redis_client.rpush(
         QUEUE_NAME,
         job_id,
     )
 
+    print()
+    print("=" * 60)
+    print("📥 NUEVO JOB CREADO")
+    print("=" * 60)
     print(
-        f"📥 Job creado: {job_id}"
+        f"🔐 Job ID: {job_id}"
     )
+    print(
+        f"🔎 Consulta: {query}"
+    )
+    print(
+        "📤 Estado: pending"
+    )
+    print(
+        "📨 Job enviado a Redis Queue."
+    )
+    print("=" * 60)
+    print()
 
     return TaskResponse(
         job_id=job_id,
@@ -166,14 +251,12 @@ async def create_task(
 # ================================================================
 
 @app.get(
-    "/tasks/{job_id}"
+    "/tasks/{job_id}",
+    response_model=TaskStatusResponse,
 )
 async def get_task(
     job_id: str,
-):
-    """
-    Consulta el estado actual de un trabajo.
-    """
+) -> TaskStatusResponse:
 
     key = f"{STATUS_PREFIX}{job_id}"
 
@@ -182,12 +265,19 @@ async def get_task(
     )
 
     if not data:
+
         raise HTTPException(
             status_code=404,
             detail="Job not found",
         )
 
-    return json.loads(data)
+    task_data = json.loads(
+        data
+    )
+
+    return TaskStatusResponse(
+        **task_data
+    )
 
 
 # ================================================================
@@ -195,43 +285,42 @@ async def get_task(
 # ================================================================
 
 @app.post(
-    "/tasks/{job_id}/approve"
+    "/tasks/{job_id}/approve",
+    response_model=ApprovalResponse,
 )
 async def approve_task(
     job_id: str,
     request: ApprovalRequest,
-):
-    """
-    Reanuda un grafo de LangGraph pausado mediante interrupt().
-
-    approved=True:
-        continúa y finaliza la ejecución.
-
-    approved=False:
-        rechaza la ejecución.
-    """
+) -> ApprovalResponse:
 
     key = f"{STATUS_PREFIX}{job_id}"
 
-    # ------------------------------------------------------------
+    # ============================================================
     # OBTENER JOB
-    # ------------------------------------------------------------
+    # ============================================================
 
-    raw = await redis_client.get(key)
+    data = await redis_client.get(
+        key
+    )
 
-    if not raw:
+    if not data:
+
         raise HTTPException(
             status_code=404,
             detail="Job not found",
         )
 
-    task_data = json.loads(raw)
+    task_data = json.loads(
+        data
+    )
 
-    # ------------------------------------------------------------
-    # VERIFICAR ESTADO HITL
-    # ------------------------------------------------------------
+    # ============================================================
+    # VERIFICAR HITL
+    # ============================================================
 
-    if task_data.get("status") != "waiting_approval":
+    if task_data.get(
+        "status"
+    ) != "waiting_approval":
 
         raise HTTPException(
             status_code=400,
@@ -241,17 +330,39 @@ async def approve_task(
             ),
         )
 
+    decision_text = (
+        "APROBADO"
+        if request.approved
+        else "RECHAZADO"
+    )
+
+    print()
+    print("=" * 60)
+    print("👤 DECISIÓN HUMANA RECIBIDA")
+    print("=" * 60)
+    print(
+        f"🔐 Job ID: {job_id}"
+    )
+    print(
+        f"👤 Decisión: {decision_text}"
+    )
+    print(
+        "▶️ Reanudando LangGraph..."
+    )
+    print("=" * 60)
+    print()
+
     try:
 
-        # --------------------------------------------------------
+        # ========================================================
         # IMPORTAR GRAFO
-        # --------------------------------------------------------
+        # ========================================================
 
         from app.graph import app as graph_app
 
-        # --------------------------------------------------------
-        # CONFIGURACIÓN
-        # --------------------------------------------------------
+        # ========================================================
+        # MISMO THREAD ID
+        # ========================================================
 
         config = {
             "configurable": {
@@ -259,20 +370,13 @@ async def approve_task(
             }
         }
 
-        print()
-        print("=" * 60)
         print(
-            f"👤 APROBACIÓN HUMANA: {job_id}"
+            f"🔗 Thread ID utilizado: {job_id}"
         )
-        print(
-            f"➡️ Decisión: "
-            f"{'APROBADO' if request.approved else 'RECHAZADO'}"
-        )
-        print("=" * 60)
 
-        # --------------------------------------------------------
-        # REANUDAR LANGGRAPH
-        # --------------------------------------------------------
+        # ========================================================
+        # RESUME LANGGRAPH
+        # ========================================================
 
         result = await graph_app.ainvoke(
             Command(
@@ -281,9 +385,13 @@ async def approve_task(
             config=config,
         )
 
-        # --------------------------------------------------------
+        print(
+            "▶️ LangGraph reanudado correctamente."
+        )
+
+        # ========================================================
         # APROBADO
-        # --------------------------------------------------------
+        # ========================================================
 
         if request.approved:
 
@@ -295,14 +403,28 @@ async def approve_task(
 
             task_data["error"] = None
 
+            print()
+            print("=" * 60)
+            print("✅ JOB COMPLETADO")
+            print("=" * 60)
             print(
-                "✅ HITL aprobado. "
-                "Ejecución finalizada."
+                f"🔐 Job ID: {job_id}"
             )
+            print(
+                "👤 Aprobación humana: TRUE"
+            )
+            print(
+                "🧠 LangGraph: FINALIZADO"
+            )
+            print(
+                "💾 Estado guardado en Redis."
+            )
+            print("=" * 60)
+            print()
 
-        # --------------------------------------------------------
+        # ========================================================
         # RECHAZADO
-        # --------------------------------------------------------
+        # ========================================================
 
         else:
 
@@ -315,14 +437,28 @@ async def approve_task(
 
             task_data["error"] = None
 
+            print()
+            print("=" * 60)
+            print("🛑 JOB RECHAZADO")
+            print("=" * 60)
             print(
-                "❌ HITL rechazado. "
-                "Ejecución detenida."
+                f"🔐 Job ID: {job_id}"
             )
+            print(
+                "👤 Aprobación humana: FALSE"
+            )
+            print(
+                "🛑 Ejecución detenida."
+            )
+            print(
+                "💾 Estado guardado en Redis."
+            )
+            print("=" * 60)
+            print()
 
-        # --------------------------------------------------------
-        # GUARDAR ESTADO
-        # --------------------------------------------------------
+        # ========================================================
+        # GUARDAR ESTADO EN REDIS
+        # ========================================================
 
         await redis_client.set(
             key,
@@ -333,17 +469,28 @@ async def approve_task(
             ),
         )
 
-        return {
-            "job_id": job_id,
-            "status": task_data["status"],
-            "result": task_data["result"],
-        }
+        return ApprovalResponse(
+            job_id=job_id,
+            status=task_data["status"],
+            human_approved=request.approved,
+            task_completed=request.approved,
+            result=task_data["result"],
+        )
 
     except Exception as error:
 
+        print()
+        print("=" * 60)
+        print("❌ ERROR AL REANUDAR JOB")
+        print("=" * 60)
         print(
-            f"❌ Error reanudando job: {error}"
+            f"🔐 Job ID: {job_id}"
         )
+        print(
+            f"❌ Error: {repr(error)}"
+        )
+        print("=" * 60)
+        print()
 
         task_data["status"] = "failed"
 
@@ -374,26 +521,24 @@ async def approve_task(
 # ================================================================
 
 @app.get(
-    "/health"
+    "/health",
+    response_model=HealthResponse,
 )
-async def health_check():
-    """
-    Verifica que la API pueda comunicarse con Redis.
-    """
+async def health_check() -> HealthResponse:
 
     try:
 
         await redis_client.ping()
 
-        return {
-            "status": "ok",
-            "redis": "connected",
-        }
+        return HealthResponse(
+            status="ok",
+            redis="connected",
+        )
 
     except Exception as error:
 
-        return {
-            "status": "error",
-            "redis": "disconnected",
-            "error": str(error),
-        }
+        return HealthResponse(
+            status="error",
+            redis="disconnected",
+            error=str(error),
+        )

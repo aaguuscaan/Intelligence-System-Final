@@ -11,13 +11,17 @@ from langgraph.graph import (
     END,
 )
 
-from app.llm import llm
 from app.state import AgentState
 
 from app.agents.research_agent import research_node
 from app.agents.analyst_agent import analyst_node
 from app.agents.validation_agent import validation_node
 from app.agents.hitl import human_approval_node
+
+
+# ================================================================
+# VARIABLES DE ENTORNO
+# ================================================================
 
 load_dotenv()
 
@@ -43,9 +47,7 @@ checkpointer = AsyncRedisSaver(
 
 async def setup_checkpointer():
     """
-    Inicializa los índices necesarios de Redis.
-
-    Debe ejecutarse antes de procesar jobs.
+    Inicializa RedisSaver.
     """
 
     await checkpointer.asetup()
@@ -57,12 +59,27 @@ async def setup_checkpointer():
 
 async def supervisor_node(
     state: AgentState,
-):
+) -> dict:
     """
-    Supervisor central del sistema.
+    Supervisor central del sistema multi-agente.
 
-    Determina qué especialista debe intervenir
-    según el estado actual del workflow.
+    Flujo:
+
+        supervisor
+            ↓
+        researcher
+            ↓
+        supervisor
+            ↓
+        analyst
+            ↓
+        supervisor
+            ↓
+        validation
+            ↓
+        human_approval
+            ↓
+        END
     """
 
     research_results = state.get(
@@ -77,164 +94,66 @@ async def supervisor_node(
         "validation_result"
     )
 
-    human_approved = state.get(
-        "human_approved"
-    )
-
     # ============================================================
-    # ESTADO ACTUAL
+    # ROUTING
     # ============================================================
 
     if not research_results:
 
-        available_state = (
-            "No existe investigación todavía."
+        decision = "researcher"
+
+        reason = (
+            "Todavía no existe una investigación. "
+            "Debe ejecutarse Researcher."
         )
 
     elif not analysis_results:
 
-        available_state = (
+        decision = "analyst"
+
+        reason = (
             "La investigación está disponible, "
-            "pero todavía no existe un análisis."
+            "pero todavía no existe un análisis. "
+            "Debe ejecutarse Analyst."
         )
 
     elif not validation_result:
 
-        available_state = (
+        decision = "validation"
+
+        reason = (
             "La investigación y el análisis están disponibles, "
-            "pero todavía no fueron validados."
-        )
-
-    elif human_approved is None:
-
-        available_state = (
-            "La investigación, el análisis y la validación "
-            "están completos, pero todavía falta la aprobación humana."
-        )
-
-    elif human_approved is True:
-
-        available_state = (
-            "La ejecución fue aprobada por una persona."
+            "pero todavía no fueron validados. "
+            "Debe ejecutarse Validation."
         )
 
     else:
 
-        available_state = (
-            "La ejecución fue rechazada por una persona."
+        decision = "human_approval"
+
+        reason = (
+            "La investigación, el análisis y la validación "
+            "están completos. Debe solicitarse aprobación humana."
         )
 
     # ============================================================
-    # PROMPT
+    # LOG
     # ============================================================
 
-    prompt = f"""
-ROLE: SUPERVISOR
-
-Sos el Supervisor de un sistema multi-agente
-de análisis e investigación.
-
-Tu función es decidir cuál agente debe intervenir
-a continuación.
-
-Agentes disponibles:
-
-- researcher
-- analyst
-- validation
-- FINISH
-
-IMPORTANTE:
-
-La aprobación humana NO es responsabilidad del Supervisor.
-La aprobación humana ocurre después de Validation.
-
-Estado actual:
-
-{available_state}
-
-Investigación:
-
-{research_results or "PENDIENTE"}
-
-Análisis:
-
-{analysis_results or "PENDIENTE"}
-
-Validación:
-
-{validation_result or "PENDIENTE"}
-
-Aprobación humana:
-
-{human_approved}
-
-Respondé únicamente con una de estas opciones:
-
-researcher
-analyst
-validation
-FINISH
-"""
-
-    response = await llm.ainvoke(
-        prompt
+    print()
+    print("🧠 SUPERVISOR")
+    print(
+        f"➡️ Próximo agente: {decision}"
     )
-
-    decision = (
-        response.content
-        .strip()
-        .lower()
+    print(
+        f"📝 Motivo: {reason}"
     )
-
-    valid_decisions = {
-        "researcher",
-        "analyst",
-        "validation",
-        "finish",
-    }
-
-    # ============================================================
-    # FALLBACK DETERMINÍSTICO
-    # ============================================================
-
-    if decision not in valid_decisions:
-
-        if not research_results:
-
-            decision = "researcher"
-
-        elif not analysis_results:
-
-            decision = "analyst"
-
-        elif not validation_result:
-
-            decision = "validation"
-
-        else:
-
-            decision = "finish"
-
-    # ============================================================
-    # NORMALIZACIÓN
-    # ============================================================
-
-    if decision == "finish":
-
-        decision = "FINISH"
+    print()
 
     return {
         "next_agent": decision,
-
-        "supervisor_reason": (
-            "El Supervisor determinó que el próximo "
-            f"paso es {decision}."
-        ),
-
-        "task_completed": (
-            decision == "FINISH"
-        ),
+        "supervisor_reason": reason,
+        "task_completed": False,
     }
 
 
@@ -248,15 +167,16 @@ def route_supervisor(
     "researcher",
     "analyst",
     "validation",
-    "FINISH",
+    "human_approval",
 ]:
 
     return state[
         "next_agent"
     ]
 
+
 # ================================================================
-# CONSTRUCCIÓN DEL GRAFO
+# WORKFLOW
 # ================================================================
 
 workflow = StateGraph(
@@ -339,18 +259,15 @@ workflow.add_conditional_edges(
 
     {
         "researcher": "researcher",
-
         "analyst": "analyst",
-
         "validation": "validation",
-
-        "FINISH": END,
+        "human_approval": "human_approval",
     },
 )
 
 
 # ================================================================
-# COMPILACIÓN
+# COMPILAR
 # ================================================================
 
 app = workflow.compile(

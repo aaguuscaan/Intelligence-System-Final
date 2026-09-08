@@ -3,16 +3,20 @@ import pytest
 from langchain_core.messages import HumanMessage
 from langgraph.types import Command
 
-from app.graph import app, setup_checkpointer
+from app.graph import (
+    app,
+    setup_checkpointer,
+)
 
 
 @pytest.mark.asyncio
 async def test_human_in_the_loop():
+
     thread_id = "test-hitl-pytest-001"
 
     config = {
         "configurable": {
-            "thread_id": thread_id
+            "thread_id": thread_id,
         }
     }
 
@@ -31,33 +35,60 @@ async def test_human_in_the_loop():
         "next_agent": None,
         "supervisor_reason": None,
         "task_completed": False,
-        "human_approved": False,
+        "human_approved": None,
     }
 
     await setup_checkpointer()
 
     interrupted = False
 
-    # Primera ejecución: debe llegar al HITL
+    # ============================================================
+    # PRIMERA EJECUCIÓN
+    # ============================================================
+
     async for state in app.astream(
         initial_state,
         config=config,
     ):
+
         if "__interrupt__" in state:
+
             interrupted = True
+
             break
 
-    assert interrupted, "El grafo no llegó al interrupt de HITL."
+    assert interrupted, (
+        "El grafo no llegó al interrupt de HITL."
+    )
 
-    # Simular aprobación humana
+    # ============================================================
+    # SIMULAR APROBACIÓN
+    # ============================================================
+
     async for _ in app.astream(
-        Command(resume=True),
+        Command(
+            resume=True
+        ),
         config=config,
     ):
         pass
 
-    # Recuperar estado final
-    final_state = await app.aget_state(config)
+    # ============================================================
+    # RECUPERAR ESTADO
+    # ============================================================
 
-    assert final_state.values.get("human_approved") is True
-    assert final_state.values.get("task_completed") is True
+    final_state = await app.aget_state(
+        config
+    )
+
+    assert (
+        final_state.values.get(
+            "human_approved"
+        ) is True
+    )
+
+    assert (
+        final_state.values.get(
+            "task_completed"
+        ) is True
+    )

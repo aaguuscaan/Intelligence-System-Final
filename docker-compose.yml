@@ -1,20 +1,20 @@
 services:
 
   redis:
-    image: redis:7-alpine
-
+    image: redis/redis-stack:latest
     container_name: pre-entrega-7-redis
-
     ports:
       - "6376:6379"
-
     volumes:
       - redis_data:/data
-
-    command: redis-server --appendonly yes
-
     restart: unless-stopped
 
+  phoenix:
+    image: arizephoenix/phoenix:latest
+    container_name: pre-entrega-7-phoenix
+    ports:
+      - "6006:6006"
+    restart: unless-stopped
 
 volumes:
 

@@ -9,9 +9,22 @@ def human_approval_node(
     """
     Nodo Human-in-the-loop.
 
-    Pausa la ejecución del grafo mediante interrupt()
-    hasta recibir una decisión humana externa.
+    Pausa el grafo hasta recibir una decisión humana.
+
+    True:
+        ejecución aprobada.
+
+    False:
+        ejecución rechazada.
     """
+
+    print()
+    print("=" * 60)
+    print("⏸️ HUMAN-IN-THE-LOOP")
+    print("=" * 60)
+    print("👤 Esperando aprobación humana...")
+    print("=" * 60)
+    print()
 
     approval = interrupt(
         {
@@ -24,11 +37,38 @@ def human_approval_node(
         }
     )
 
+    # ============================================================
+    # APROBADO
+    # ============================================================
+
     if approval is True or approval == "approve":
+
+        print()
+        print("=" * 60)
+        print("👤 HUMAN APPROVAL")
+        print("=" * 60)
+        print("✅ Decisión: APROBADO")
+        print("🏁 Ejecución autorizada para finalizar.")
+        print("=" * 60)
+        print()
+
         return {
             "human_approved": True,
             "task_completed": True,
         }
+
+    # ============================================================
+    # RECHAZADO
+    # ============================================================
+
+    print()
+    print("=" * 60)
+    print("👤 HUMAN APPROVAL")
+    print("=" * 60)
+    print("❌ Decisión: RECHAZADO")
+    print("🛑 Ejecución detenida.")
+    print("=" * 60)
+    print()
 
     return {
         "human_approved": False,

@@ -1,16 +1,22 @@
 import pytest
+
 from langchain_core.messages import HumanMessage
 
-from app.graph import app, setup_checkpointer
+from app.graph import (
+    app,
+    setup_checkpointer,
+    checkpointer,
+)
 
 
 @pytest.mark.asyncio
 async def test_persistencia_redis():
+
     thread_id = "test-persistence-pytest-001"
 
     config = {
         "configurable": {
-            "thread_id": thread_id
+            "thread_id": thread_id,
         }
     }
 
@@ -29,25 +35,47 @@ async def test_persistencia_redis():
         "next_agent": None,
         "supervisor_reason": None,
         "task_completed": False,
-        "human_approved": False,
+        "human_approved": None,
     }
 
     await setup_checkpointer()
 
     try:
-        # Ejecutar el grafo hasta HITL
+
+        # ========================================================
+        # EJECUTAR HASTA HITL
+        # ========================================================
+
+        interrupted = False
+
         async for state in app.astream(
             initial_state,
             config=config,
         ):
+
             if "__interrupt__" in state:
+
+                interrupted = True
+
                 break
 
-        # Recuperar el estado desde Redis
-        recovered_state = await app.aget_state(config)
+        assert interrupted, (
+            "El grafo no llegó al interrupt de HITL."
+        )
+
+        # ========================================================
+        # RECUPERAR ESTADO
+        # ========================================================
+
+        recovered_state = await app.aget_state(
+            config
+        )
 
         assert recovered_state.values
-        assert recovered_state.values["messages"]
+
+        assert recovered_state.values.get(
+            "messages"
+        )
 
         assert (
             recovered_state.values["messages"][0].content
@@ -56,11 +84,17 @@ async def test_persistencia_redis():
         )
 
     finally:
-        # Cerrar correctamente la conexión async de Redis
-        checkpointer = getattr(app, "checkpointer", None)
 
-        if checkpointer is not None:
-            redis_client = getattr(checkpointer, "redis_client", None)
+        # ========================================================
+        # CERRAR REDIS CHECKPOINTER
+        # ========================================================
 
-            if redis_client is not None:
-                await redis_client.aclose()
+        redis_client = getattr(
+            checkpointer,
+            "redis_client",
+            None,
+        )
+
+        if redis_client is not None:
+
+            await redis_client.aclose()

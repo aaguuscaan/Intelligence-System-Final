@@ -1,9 +1,12 @@
 import asyncio
 import json
 import os
+import re
 
 from dotenv import load_dotenv
+
 from langchain_core.messages import HumanMessage
+
 from redis import asyncio as aioredis
 
 from app.graph import (
@@ -43,6 +46,10 @@ STATUS_PREFIX = os.getenv(
     "task_status:",
 )
 
+MAX_RETRIES = 3
+
+RETRY_DELAY = 10
+
 
 # ================================================================
 # CLIENTE REDIS
@@ -55,7 +62,7 @@ redis_client = aioredis.from_url(
 
 
 # ================================================================
-# ACTUALIZAR ESTADO DEL JOB
+# ACTUALIZAR ESTADO
 # ================================================================
 
 async def update_status(
@@ -75,7 +82,8 @@ async def update_status(
     if not raw:
 
         print(
-            f"⚠️ No se encontró el estado del job: {job_id}"
+            f"⚠️ No se encontró el estado "
+            f"del job: {job_id}"
         )
 
         return
@@ -90,7 +98,6 @@ async def update_status(
 
     await redis_client.set(
         key,
-
         json.dumps(
             data,
             ensure_ascii=False,
@@ -100,39 +107,138 @@ async def update_status(
 
 
 # ================================================================
+# DETECTAR 429
+# ================================================================
+
+def is_rate_limit_error(
+    error: Exception,
+) -> bool:
+
+    error_text = str(
+        error
+    ).lower()
+
+    return (
+        "429" in error_text
+        or "resource_exhausted" in error_text
+        or "rate limit" in error_text
+        or "quota exceeded" in error_text
+    )
+
+
+# ================================================================
+# RETRY DELAY
+# ================================================================
+
+def get_retry_delay(
+    error: Exception,
+    attempt: int,
+) -> int:
+
+    error_text = str(
+        error
+    )
+
+    match = re.search(
+        r"retryDelay.*?(\d+)s",
+        error_text,
+        re.IGNORECASE,
+    )
+
+    if match:
+
+        return max(
+            int(match.group(1)),
+            5,
+        )
+
+    return RETRY_DELAY * attempt
+
+
+# ================================================================
+# EJECUTAR LANGGRAPH
+# ================================================================
+
+async def execute_graph_with_retry(
+    initial_state,
+    config,
+):
+
+    for attempt in range(
+        1,
+        MAX_RETRIES + 1,
+    ):
+
+        try:
+
+            print(
+                f"🧠 Ejecutando LangGraph "
+                f"(intento {attempt}/{MAX_RETRIES})..."
+            )
+
+            result = await app.ainvoke(
+                initial_state,
+                config=config,
+            )
+
+            return result
+
+        except Exception as error:
+
+            if not is_rate_limit_error(
+                error
+            ):
+
+                raise
+
+            print()
+            print("=" * 60)
+            print("⚠️ LÍMITE DE GEMINI DETECTADO")
+            print("=" * 60)
+            print(
+                f"🔄 Intento: "
+                f"{attempt}/{MAX_RETRIES}"
+            )
+            print(
+                f"❌ Error: {repr(error)}"
+            )
+
+            if attempt >= MAX_RETRIES:
+
+                print(
+                    "❌ Se alcanzó el máximo "
+                    "de reintentos."
+                )
+
+                raise
+
+            delay = get_retry_delay(
+                error,
+                attempt,
+            )
+
+            print(
+                f"⏳ Esperando {delay} segundos "
+                "antes de reintentar..."
+            )
+
+            print("=" * 60)
+            print()
+
+            await asyncio.sleep(
+                delay
+            )
+
+
+# ================================================================
 # PROCESAR JOB
 # ================================================================
 
 async def process_job(
     job_id: str,
 ):
-    """
-    Procesa un trabajo mediante:
-
-        Redis Queue
-             ↓
-           Worker
-             ↓
-         LangGraph
-             ↓
-         Supervisor
-             ↓
-        Researcher
-             ↓
-          Analyst
-             ↓
-        Validation
-             ↓
-           HITL
-             ↓
-         Redis/API
-    """
 
     key = f"{STATUS_PREFIX}{job_id}"
-
-    # ============================================================
-    # OBTENER JOB
-    # ============================================================
 
     raw = await redis_client.get(
         key
@@ -165,23 +271,13 @@ async def process_job(
     )
     print("=" * 60)
 
-    # ============================================================
-    # RUNNING
-    # ============================================================
-
     await update_status(
         job_id,
-
         status="running",
-
         error=None,
     )
 
     try:
-
-        # ========================================================
-        # CONFIG LANGGRAPH
-        # ========================================================
 
         config = {
             "configurable": {
@@ -189,75 +285,25 @@ async def process_job(
             }
         }
 
-        # ========================================================
-        # ESTADO INICIAL
-        # ========================================================
-
         initial_state = {
             "messages": [
                 HumanMessage(
                     content=query
                 )
             ],
-
+            "research_results": None,
+            "analysis_results": None,
+            "validation_result": None,
+            "next_agent": None,
+            "supervisor_reason": None,
+            "human_approved": None,
             "task_completed": False,
         }
 
-        # ========================================================
-        # EJECUCIÓN
-        # ========================================================
-
-        result = await app.ainvoke(
+        result = await execute_graph_with_retry(
             initial_state,
-            config=config,
+            config,
         )
-
-        # ========================================================
-        # NODOS EJECUTADOS
-        # ========================================================
-
-        if isinstance(result, dict):
-
-            executed_nodes = []
-
-            if result.get(
-                "research_results"
-            ):
-
-                executed_nodes.append(
-                    "researcher"
-                )
-
-            if result.get(
-                "analysis_results"
-            ):
-
-                executed_nodes.append(
-                    "analyst"
-                )
-
-            if result.get(
-                "validation_result"
-            ):
-
-                executed_nodes.append(
-                    "validation"
-                )
-
-            if result.get(
-                "human_approved"
-            ) is not None:
-
-                executed_nodes.append(
-                    "human_approval"
-                )
-
-            if executed_nodes:
-
-                print(
-                    "📊 Nodos completados: "
-                    f"{executed_nodes}"
-                )
 
         # ========================================================
         # DETECTAR INTERRUPCIÓN
@@ -265,7 +311,10 @@ async def process_job(
 
         interrupts = None
 
-        if isinstance(result, dict):
+        if isinstance(
+            result,
+            dict,
+        ):
 
             interrupts = result.get(
                 "__interrupt__"
@@ -275,22 +324,16 @@ async def process_job(
 
             print()
             print("=" * 60)
-            print(
-                "⏸️ LANGGRAPH PAUSADO POR HITL"
-            )
+            print("⏸️ LANGGRAPH PAUSADO POR HITL")
             print("=" * 60)
-
             print(
                 "👤 Esperando aprobación humana..."
             )
-
             print(
                 f"🔐 Thread ID: {job_id}"
             )
-
-            # ====================================================
-            # GUARDAR ESTADO
-            # ====================================================
+            print("=" * 60)
+            print()
 
             await update_status(
                 job_id,
@@ -311,19 +354,15 @@ async def process_job(
                 "💾 Estado HITL guardado en Redis."
             )
 
-            print()
-
             return
 
         # ========================================================
-        # COMPLETADO
+        # APROBADO
         # ========================================================
 
         if (
             isinstance(result, dict)
-            and result.get(
-                "human_approved"
-            ) is True
+            and result.get("human_approved") is True
         ):
 
             await update_status(
@@ -331,9 +370,7 @@ async def process_job(
 
                 status="completed",
 
-                result=str(
-                    result
-                ),
+                result=str(result),
 
                 error=None,
             )
@@ -341,7 +378,8 @@ async def process_job(
             print()
             print("=" * 60)
             print(
-                f"✅ JOB APROBADO Y COMPLETADO: {job_id}"
+                f"✅ JOB APROBADO Y COMPLETADO: "
+                f"{job_id}"
             )
             print("=" * 60)
             print()
@@ -354,9 +392,7 @@ async def process_job(
 
         if (
             isinstance(result, dict)
-            and result.get(
-                "human_approved"
-            ) is False
+            and result.get("human_approved") is False
         ):
 
             await update_status(
@@ -383,7 +419,7 @@ async def process_job(
             return
 
         # ========================================================
-        # CASO INESPERADO
+        # CASO NORMAL
         # ========================================================
 
         await update_status(
@@ -391,9 +427,7 @@ async def process_job(
 
             status="completed",
 
-            result=str(
-                result
-            ),
+            result=str(result),
 
             error=None,
         )
@@ -405,10 +439,6 @@ async def process_job(
         )
         print("=" * 60)
         print()
-
-    # ============================================================
-    # ERROR
-    # ============================================================
 
     except Exception as error:
 
@@ -423,14 +453,29 @@ async def process_job(
             repr(error)
         )
 
+        if is_rate_limit_error(
+            error
+        ):
+
+            error_message = (
+                "Se agotó la cuota de Gemini "
+                "para este modelo. "
+                "El sistema realizó los reintentos "
+                "configurados sin éxito."
+            )
+
+        else:
+
+            error_message = str(
+                error
+            )
+
         await update_status(
             job_id,
 
             status="failed",
 
-            error=str(
-                error
-            ),
+            error=error_message,
         )
 
         print(
@@ -448,9 +493,7 @@ async def worker():
 
     print()
     print("=" * 60)
-    print(
-        "👷 WORKER INICIADO"
-    )
+    print("👷 WORKER INICIADO")
     print("=" * 60)
 
     print(
@@ -488,7 +531,7 @@ async def worker():
     print_observability_status()
 
     # ============================================================
-    # REDIS CHECKPOINTER
+    # CHECKPOINTER
     # ============================================================
 
     print(
